@@ -1,0 +1,307 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, random_split, Subset
+import random
+import string
+import copy
+import numpy as np
+from collections import defaultdict
+import matplotlib.pyplot as plt
+from sklearn.metrics import confusion_matrix, precision_score, recall_score, f1_score, accuracy_score
+
+# ========================
+# 1. Dataset Implementation
+# ========================
+class AlphanumericDataset(Dataset):
+    def __init__(self, num_samples=1000):
+        self.categories = ["A1", "B2", "C3", "D4"]
+        self.samples = []
+        self.labels = []
+        
+        # Generate synthetic data with class imbalance
+        class_dist = [0.4, 0.3, 0.2, 0.1]
+        for _ in range(num_samples):
+            class_idx = np.random.choice(4, p=class_dist)
+            text = f"{self.categories[class_idx]}-{random.randint(100, 999)}"
+            self.samples.append(text)
+            self.labels.append(class_idx)
+
+        # Initialize vocabulary
+        self.vocab = {'<PAD>': 0, **{ch: i+1 for i, ch in enumerate(string.ascii_uppercase + string.digits + '-')}}
+
+    def __len__(self):
+        return len(self.labels)
+
+    def text_to_tensor(self, text):
+        return torch.tensor([self.vocab.get(ch, 0) for ch in text], dtype=torch.long)
+
+    def __getitem__(self, idx):
+        return self.text_to_tensor(self.samples[idx]), torch.tensor(self.labels[idx])
+
+# ========================
+# 2. Collate Function and Model
+# ========================
+def collate_fn(batch):
+    texts, labels = zip(*batch)
+    lengths = torch.tensor([len(t) for t in texts])
+    padded_texts = torch.nn.utils.rnn.pad_sequence(texts, batch_first=True, padding_value=0)
+    return padded_texts, torch.stack(labels), lengths
+
+class AlphanumericClassifier(nn.Module):
+    def __init__(self, vocab_size, embed_dim=16, hidden_dim=64):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+        self.lstm = nn.LSTM(embed_dim, hidden_dim, batch_first=True)
+        self.fc = nn.Linear(hidden_dim, 4)
+
+    def forward(self, x, lengths):
+        x = self.embedding(x)
+        packed = nn.utils.rnn.pack_padded_sequence(x, lengths.cpu(), batch_first=True, enforce_sorted=False)
+        _, (hidden, _) = self.lstm(packed)
+        return torch.log_softmax(self.fc(hidden.squeeze(0)), dim=1)
+
+# ========================
+# 3. Enhanced Federated Learning Server
+# ========================
+class FederatedServer:
+    def __init__(self, global_model, num_honest, num_adversarial):
+        self.global_model = global_model
+        self.participants = []
+        self.total_participants = num_honest + num_adversarial
+        self.reputations = torch.ones(self.total_participants)
+        self.threshold = 0.25  # Adjusted threshold
+        self.reputation_history = []
+        
+        # Initialize participants with better shuffling
+        participant_types = [False]*num_honest + [True]*num_adversarial
+        for _ in range(5):  # Multiple shuffles
+            random.shuffle(participant_types)
+        
+        for i, is_adv in enumerate(participant_types):
+            self.participants.append({
+                'id': i,
+                'model': copy.deepcopy(self.global_model),
+                'data': None,
+                'is_adversarial': is_adv,
+                'active': True
+            })
+        
+        self.participant_types = [p['is_adversarial'] for p in self.participants]
+
+    def aggregate(self, gradients, participant_indices):
+        valid_gradients = [g for g in gradients if g is not None]
+        if not valid_gradients:
+            return None
+        
+        # Use median for robustness
+        avg_grad = [torch.stack([g[i] for g in valid_gradients]).median(0).values 
+                   for i in range(len(valid_gradients[0]))]
+        return avg_grad
+
+    def update_reputations(self, gradients, participant_indices):
+        avg_grad = self.aggregate(gradients, participant_indices)
+        if avg_grad is None:
+            return
+            
+        flat_avg = torch.cat([g.view(-1) for g in avg_grad])
+
+        for i, (grad, idx) in enumerate(zip(gradients, participant_indices)):
+            if grad is None:
+                continue
+                
+            flat_grad = torch.cat([g.view(-1) for g in grad])
+            similarity = torch.cosine_similarity(flat_avg, flat_grad, dim=0)
+            l2_dist = torch.norm(flat_avg - flat_grad, p=2)
+            similarity = (similarity + 1) / 2 * torch.exp(-0.5 * l2_dist)  # Balanced measure
+            self.reputations[idx] = 0.9 * self.reputations[idx] + 0.1 * similarity  # Slower update
+        
+        self.reputation_history.append(self.reputations.clone().cpu())
+
+# ========================
+# 4. Training Function
+# ========================
+def train_participant(model, data_loader, is_adversarial=False, epochs=1):
+    optimizer = optim.SGD(model.parameters(), lr=0.01)
+    model.train()
+    gradients = []
+
+    for _ in range(epochs):
+        for texts, labels, lengths in data_loader:
+            texts, labels = texts.to(device), labels.to(device)
+
+            if is_adversarial:
+                # More subtle attacks
+                attack_type = random.choice(['label_flip', 'noise'])
+                if attack_type == 'label_flip':
+                    flip_mask = torch.rand(labels.shape) < 0.3  # Only flip 30% of samples
+                    labels[flip_mask] = (labels[flip_mask] + 1) % 4
+                else:
+                    texts = texts.float()
+                    texts += torch.randn_like(texts) * 0.2
+                    texts = texts.round().long().clamp(0, len(dataset.vocab)-1)
+
+            optimizer.zero_grad()
+            outputs = model(texts, lengths)
+            loss = nn.NLLLoss()(outputs, labels)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.3)
+            gradients = [p.grad.clone() for p in model.parameters()]
+            optimizer.step()
+
+    return gradients
+
+# ========================
+# 5. Enhanced Evaluation Metrics
+# ========================
+def calculate_metrics(server, removed_participants):
+    y_true = np.array([1 if p['is_adversarial'] else 0 for p in server.participants])
+    y_pred = np.array([1 if i in removed_participants else 0 for i in range(len(server.participants))])
+    
+    # Calculate metrics
+    accuracy = accuracy_score(y_true, y_pred)
+    precision = precision_score(y_true, y_pred)
+    recall = recall_score(y_true, y_pred)
+    f1 = f1_score(y_true, y_pred)
+    
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
+    
+    return {
+        'accuracy': accuracy * 100,
+        'precision': precision * 100,
+        'recall': recall * 100,
+        'f1': f1 * 100,
+        'true_positives': tp,
+        'false_positives': fp,
+        'true_negatives': tn,
+        'false_negatives': fn
+    }
+
+# ========================
+# 6. Visualization and Reporting
+# ========================
+def print_detection_performance(metrics):
+    print("\nDETECTION PERFORMANCE:")
+    print("--------------------------------------------------")
+    print(f"{'Accuracy:':<15}{metrics['accuracy']:.2f}%")
+    print(f"{'Precision:':<15}{metrics['precision']:.2f}%")
+    print(f"{'Recall:':<15}{metrics['recall']:.2f}%")
+    print(f"{'F1 Score:':<15}{metrics['f1']:.2f}%")
+    print("--------------------------------------------------")
+    print(f"{'True Positives:':<20}{metrics['true_positives']}")
+    print(f"{'False Positives:':<20}{metrics['false_positives']}")
+    print(f"{'True Negatives:':<20}{metrics['true_negatives']}")
+    print(f"{'False Negatives:':<20}{metrics['false_negatives']}")
+    print("--------------------------------------------------")
+
+def plot_reputation_history(server, removed_participants=None):
+    history = torch.stack(server.reputation_history)
+    plt.figure(figsize=(10, 6))
+    
+    for i, p in enumerate(server.participants):
+        color = 'red' if p['is_adversarial'] else 'blue'
+        linestyle = '--' if i in removed_participants else '-'
+        plt.plot(history[:, i], color=color, linestyle=linestyle, alpha=0.5)
+    
+    plt.axhline(y=server.threshold, color='green', linestyle='-', label='Threshold')
+    plt.xlabel('Rounds')
+    plt.ylabel('Reputation Score')
+    plt.title('Participant Reputation Scores Over Time')
+    plt.legend(['Adversarial', 'Honest', 'Removed', 'Threshold'])
+    plt.grid(True)
+    return plt.gcf()
+
+# ========================
+# 7. Complete Simulation
+# ========================
+def run_simulation(num_honest=20, num_adversarial=15, num_samples=1000, rounds=15):
+    # Set random seeds for reproducibility
+    random.seed(42)
+    np.random.seed(42)
+    torch.manual_seed(42)
+    
+    # Create dataset and model
+    dataset = AlphanumericDataset(num_samples=num_samples)
+    model = AlphanumericClassifier(len(dataset.vocab)).to(device)
+    
+    # Initialize server
+    server = FederatedServer(model, num_honest, num_adversarial)
+    
+    # Split dataset
+    indices = list(range(len(dataset)))
+    random.shuffle(indices)
+    splits = np.array_split(indices, len(server.participants))
+    
+    # Assign data
+    for i, split in enumerate(splits):
+        subset = Subset(dataset, split)
+        loader = DataLoader(subset, batch_size=32, collate_fn=collate_fn, shuffle=True)
+        server.participants[i]['data'] = loader
+    
+    print(f"Starting FL with {num_honest} honest and {num_adversarial} adversarial participants")
+    
+    removed_participants = []
+    for round in range(rounds):
+        gradients = []
+        active_indices = []
+        
+        # Train participants
+        for i, p in enumerate(server.participants):
+            if not p['active']:
+                continue
+                
+            grad = train_participant(
+                p['model'],
+                p['data'],
+                is_adversarial=p['is_adversarial']
+            )
+            gradients.append(grad)
+            active_indices.append(i)
+        
+        # Update reputations and aggregate
+        server.update_reputations(gradients, active_indices)
+        avg_grad = server.aggregate(gradients, active_indices)
+        
+        # Update global model
+        if avg_grad is not None:
+            with torch.no_grad():
+                for param, grad in zip(server.global_model.parameters(), avg_grad):
+                    param -= grad * 0.1
+        
+        # Remove low-reputation participants
+        new_removed = []
+        for i in active_indices:
+            if server.reputations[i] < server.threshold:
+                server.participants[i]['active'] = False
+                new_removed.append(i)
+                removed_participants.append(i)
+        
+        # Print progress
+        if new_removed:
+            print(f"Round {round+1}: Removed participants {new_removed}")
+    
+    # Final evaluation
+    metrics = calculate_metrics(server, removed_participants)
+    print_detection_performance(metrics)
+    fig = plot_reputation_history(server, removed_participants)
+    
+    return server, removed_participants, metrics, fig
+
+# ========================
+# 8. Main Execution
+# ========================
+if __name__ == "__main__":
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
+    # Run simulation
+    server, removed, metrics, fig = run_simulation(
+        num_honest=20,
+        num_adversarial=30,
+        num_samples=10000,
+        rounds=20
+    )
+    
+    # Save visualization
+    fig.savefig('reputation_history.png', bbox_inches='tight')
+    plt.close(fig)

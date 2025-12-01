@@ -1,0 +1,821 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, random_split, Subset
+import random
+import string
+import copy
+import numpy as np
+from collections import defaultdict
+import matplotlib.pyplot as plt
+from sklearn.metrics import confusion_matrix, precision_score, recall_score, f1_score, accuracy_score
+
+# ========================
+# 1. Dataset Implementation
+# ========================
+class AlphanumericDataset(Dataset):
+    def __init__(self, num_samples=1000):
+        self.categories = ["A1", "B2", "C3", "D4"]
+        self.samples = []
+        self.labels = []
+        
+        class_dist = [0.4, 0.3, 0.2, 0.1]
+        for _ in range(num_samples):
+            class_idx = np.random.choice(4, p=class_dist)
+            text = f"{self.categories[class_idx]}-{random.randint(100, 999)}"
+            self.samples.append(text)
+            self.labels.append(class_idx)
+
+        self.vocab = {'<PAD>': 0, **{ch: i+1 for i, ch in enumerate(string.ascii_uppercase + string.digits + '-')}}
+
+    def __len__(self):
+        return len(self.labels)
+
+    def text_to_tensor(self, text):
+        return torch.tensor([self.vocab.get(ch, 0) for ch in text], dtype=torch.long)
+
+    def __getitem__(self, idx):
+        return self.text_to_tensor(self.samples[idx]), torch.tensor(self.labels[idx])
+
+# ========================
+# 2. Collate Function and Model
+# ========================
+def collate_fn(batch):
+    texts, labels = zip(*batch)
+    lengths = torch.tensor([len(t) for t in texts])
+    padded_texts = torch.nn.utils.rnn.pad_sequence(texts, batch_first=True, padding_value=0)
+    return padded_texts, torch.stack(labels), lengths
+
+class ImprovedClassifier(nn.Module):
+    def __init__(self, vocab_size, embed_dim=24, hidden_dim=64):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+        self.dropout = nn.Dropout(0.2)
+        self.lstm = nn.LSTM(embed_dim, hidden_dim, batch_first=True, bidirectional=True)
+        self.fc = nn.Linear(hidden_dim * 2, 4)  # Using bidirectional output
+
+    def forward(self, x, lengths):
+        x = self.embedding(x)
+        x = self.dropout(x)
+        packed = nn.utils.rnn.pack_padded_sequence(x, lengths.cpu(), batch_first=True, enforce_sorted=False)
+        _, (hidden, _) = self.lstm(packed)
+        # Combine forward and backward hidden states
+        hidden_combined = torch.cat((hidden[0], hidden[1]), dim=1)
+        return torch.log_softmax(self.fc(hidden_combined), dim=1)
+
+# ========================
+# 3. Balanced Federated Learning Server
+# ========================
+class FederatedServer:
+    def __init__(self, global_model, num_honest, num_adversarial):
+        self.global_model = global_model
+        self.participants = []
+        self.total_participants = num_honest + num_adversarial
+        
+        # Parameters - adjusted for better balance
+        self.num_byzantines = min(num_adversarial, num_honest//2)
+        self.multi_krum_m = 5
+        self.current_round = 0
+        
+        # CRITICAL ADJUSTMENTS for better balance
+        self.removal_threshold = 3.5  # Higher threshold to protect honest participants
+        self.max_removal_rate = 0.1   # Lower removal rate to be more conservative
+        self.bootstrap_rounds = 7     # More bootstrap rounds to better establish baselines
+        self.whitelist_rounds = 7     # Longer whitelist period
+        self.selection_protection = 0.3  # Protection threshold for frequently selected participants
+        
+        # Additional protections
+        self.min_participants = max(5, num_honest // 10)  # Ensure enough participants remain
+        self.honest_protection_factor = 2.0  # Make it harder to remove honest participants
+        
+        # Tracking
+        self.score_history = defaultdict(list)
+        self.reputation_history = [torch.ones(self.total_participants)]
+        self.model_acc_history = []
+        self.selection_history = defaultdict(list)
+        
+        # Initialize participants
+        participant_types = [False]*num_honest + [True]*num_adversarial
+        random.shuffle(participant_types)
+        
+        for i, is_adv in enumerate(participant_types):
+            self.participants.append({
+                'id': i,
+                'model': copy.deepcopy(global_model),
+                'data': None,
+                'is_adversarial': is_adv,
+                'active': True,
+                'scores': [],
+                'selection_count': 0,
+                'outlier_frequency': 0,
+                'removed_round': None
+            })
+
+    def multi_krum(self, gradients, active_indices):
+        """Enhanced Multi-Krum with better protections"""
+        valid_grads = []
+        valid_indices = []
+        
+        for i, idx in enumerate(active_indices):
+            if gradients[i] is not None:
+                valid_grads.append(gradients[i])
+                valid_indices.append(idx)
+                
+        if not valid_grads:
+            return [], [], None
+        
+        # Flatten gradients
+        flat_grads = [torch.cat([g.view(-1) for g in grad]) for grad in valid_grads]
+        
+        # Filter extreme gradient norms
+        grad_norms = [torch.norm(g).item() for g in flat_grads]
+        median_norm = np.median(grad_norms)
+        extreme_threshold = 3.0
+        
+        filtered_grads = []
+        filtered_indices = []
+        
+        for i, (norm, idx) in enumerate(zip(grad_norms, valid_indices)):
+            rel_dev = abs(norm - median_norm) / (median_norm + 1e-10)
+            if rel_dev < extreme_threshold:
+                filtered_grads.append(flat_grads[i])
+                filtered_indices.append(idx)
+        
+        if len(filtered_grads) < 3:  # If too many filtered, revert to original
+            filtered_grads = flat_grads
+            filtered_indices = valid_indices
+        
+        # Compute distances with filtered gradients
+        n = len(filtered_grads)
+        distances = torch.zeros((n, n))
+        
+        for i in range(n):
+            for j in range(i+1, n):
+                dist = torch.sum((filtered_grads[i] - filtered_grads[j])**2).item()
+                distances[i,j] = distances[j,i] = dist
+        
+        # Compute scores
+        krum_scores = torch.zeros(n)
+        f = min(self.num_byzantines, n-2)
+        
+        for i in range(n):
+            dist_i = distances[i]
+            neighbor_distances, _ = torch.sort(dist_i)
+            krum_scores[i] = torch.sum(neighbor_distances[1:n-f])
+        
+        # Select top m gradients
+        _, sorted_indices = torch.sort(krum_scores)
+        m = min(self.multi_krum_m, n)
+        selected_indices_local = sorted_indices[:m].tolist()
+        selected_indices = [filtered_indices[i] for i in selected_indices_local]
+        
+        # Improved aggregation - using weighted aggregation
+        selected_grads = [filtered_grads[i] for i in selected_indices_local]
+        selected_scores = [krum_scores[i].item() for i in selected_indices_local]
+        
+        # Inverse weighting - lower scores get higher weights
+        if len(selected_grads) >= 3:
+            max_score = max(selected_scores)
+            weights = [max(0.1, (max_score - score + 1e-5) / (max_score + 1e-5)) for score in selected_scores]
+            total_weight = sum(weights)
+            weights = [w / total_weight for w in weights]
+            
+            # Weighted average
+            aggregated = torch.zeros_like(selected_grads[0])
+            for i, grad in enumerate(selected_grads):
+                aggregated += grad * weights[i]
+        else:
+            # Simple mean for small selection
+            aggregated = torch.stack(selected_grads).mean(dim=0)
+        
+        # Prepare scores
+        all_scores = [None] * len(gradients)
+        for i, idx in enumerate(filtered_indices):
+            all_scores[active_indices.index(idx)] = krum_scores[i].item()
+        
+        return selected_indices, all_scores, aggregated
+
+    def detect_anomalies(self, active_indices):
+        """Conservative anomaly detection to protect honest participants"""
+        # No removal during whitelist period or if too few participants
+        if (self.current_round <= self.whitelist_rounds or 
+            len(active_indices) <= self.min_participants):
+            return []
+            
+        anomalies = []
+        if len(active_indices) < 5:
+            return anomalies
+        
+        # Get historical data for analysis
+        historical_data = {}
+        for idx in active_indices:
+            if len(self.score_history[idx]) >= 3:
+                # Get recent scores
+                recent_scores = [s for s in self.score_history[idx][-3:] if s is not None]
+                if not recent_scores:
+                    continue
+                    
+                # Calculate selection rate - a crucial metric
+                selection_rate = self.participants[idx]['selection_count'] / max(1, self.current_round)
+                # Track selection history for this participant
+                self.selection_history[idx].append(selection_rate)
+                
+                # Calculate consistency metrics
+                if len(recent_scores) >= 2:
+                    trend = recent_scores[-1] - recent_scores[0]
+                    variation = np.std(recent_scores) / (np.mean(recent_scores) + 1e-10)
+                else:
+                    trend = 0.0
+                    variation = 0.0
+                
+                # Protection score - higher means more likely to be honest
+                protection_score = selection_rate * self.honest_protection_factor
+                
+                # Store metrics for this participant
+                historical_data[idx] = {
+                    'raw_score': np.mean(recent_scores),
+                    'selection_rate': selection_rate,
+                    'trend': trend,
+                    'variation': variation,
+                    'protection_score': protection_score
+                }
+        
+        if not historical_data:
+            return anomalies
+            
+        # Compute robust statistics
+        raw_scores = [info['raw_score'] for info in historical_data.values() if info['raw_score'] is not None]
+        if not raw_scores:
+            return anomalies
+            
+        median_score = np.median(raw_scores)
+        mad = np.median([abs(s - median_score) for s in raw_scores]) + 1e-10
+        
+        # Determine removals with strong protections for honest participants
+        candidates = []
+        
+        for idx, info in historical_data.items():
+            # Calculate z-score (deviation from median in MAD units)
+            z_score = (info['raw_score'] - median_score) / mad
+            
+            # Apply protection based on selection rate
+            # Frequently selected participants are likely honest
+            if info['selection_rate'] >= self.selection_protection:
+                continue  # Skip frequently selected participants
+                
+            # Calculate combined anomaly score
+            anomaly_score = z_score - info['protection_score']
+            
+            # Only consider participants that exceed threshold
+            if anomaly_score > self.removal_threshold:
+                candidates.append((anomaly_score, idx))
+        
+        # Sort candidates and apply removal rate limit
+        candidates.sort(reverse=True)
+        # CRITICAL: More restrictive limit as training progresses
+        max_removals = min(2, max(1, int(len(active_indices) * self.max_removal_rate * 
+                           (0.7 ** (self.current_round // 5)))))
+        
+        # Do not remove too many participants in later rounds
+        if self.current_round > 15 and len(candidates) > 0:
+            max_removals = 1
+            
+        anomalies = [idx for _, idx in candidates[:max_removals]]
+        
+        return anomalies
+
+    def update_model(self, gradients, active_indices, val_loader=None):
+        """Update model with aggregated gradients"""
+        self.current_round += 1
+        
+        # Apply Multi-Krum
+        selected_indices, krum_scores, aggregated = self.multi_krum(gradients, active_indices)
+        
+        # Dynamic step size scheduling
+        if self.current_round < 5:
+            step_size = 0.05  # Conservative early on
+        elif self.current_round < 10:
+            step_size = 0.08  # Medium
+        else:
+            step_size = 0.10  # Standard
+            
+        # Update global model
+        if aggregated is not None:
+            idx = 0
+            for param in self.global_model.parameters():
+                param_size = param.numel()
+                grad_portion = aggregated[idx:idx+param_size].view(param.shape)
+                with torch.no_grad():
+                    param -= grad_portion * step_size
+                idx += param_size
+        
+        # Update selection counts and score history
+        for i, idx in enumerate(active_indices):
+            if idx < len(krum_scores) and krum_scores[i] is not None:
+                self.score_history[idx].append(krum_scores[i])
+                
+                if idx in selected_indices:
+                    self.participants[idx]['selection_count'] += 1
+        
+        # Calculate outlier frequency
+        for idx in active_indices:
+            if len(self.score_history[idx]) >= 3:
+                scores = [s for s in self.score_history[idx] if s is not None]
+                if not scores:
+                    continue
+                    
+                all_scores = [s for participant_scores in self.score_history.values() 
+                             for s in participant_scores if s is not None]
+                if all_scores:
+                    median_all = np.median(all_scores)
+                    mad_all = np.median([abs(s - median_all) for s in all_scores]) + 1e-10
+                    outlier_count = sum(1 for s in scores if abs(s - median_all) > 1.5 * mad_all)
+                    self.participants[idx]['outlier_frequency'] = outlier_count / len(scores)
+        
+        # Evaluate and track model accuracy
+        if val_loader:
+            current_acc = self.evaluate_model(val_loader)
+            self.model_acc_history.append(current_acc)
+        
+        return selected_indices, krum_scores
+
+    def evaluate_model(self, data_loader, model=None):
+        """Evaluate model accuracy"""
+        model_to_eval = model if model is not None else self.global_model
+        model_to_eval.eval()
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            for texts, labels, lengths in data_loader:
+                # Force device to CPU for compatibility
+                texts, labels = texts.to('cpu'), labels.to('cpu')
+                outputs = model_to_eval(texts, lengths)
+                _, predicted = torch.max(outputs.data, 1)
+                total += labels.size(0)
+                correct += (predicted == labels).sum().item()
+        return correct / total if total > 0 else 0
+
+# ========================
+# 4. Improved Training Function
+# ========================
+def train_participant(model, data_loader, is_adversarial=False, epoch=0):
+    """Training function with adaptive adversarial behavior"""
+    # Dynamic learning rate
+    if epoch < 3:
+        lr = 0.005  # Start conservative
+    elif epoch < 8:
+        lr = 0.01   # Standard rate
+    else:
+        lr = 0.007  # Decrease slightly for stability
+        
+    optimizer = optim.SGD(model.parameters(), lr=lr, momentum=0.9)
+    model.train()
+    gradients = []
+
+    for texts, labels, lengths in data_loader:
+        # Force device to CPU for compatibility
+        texts, labels = texts.to('cpu'), labels.to('cpu')
+
+        if is_adversarial:
+            # More sophisticated attack strategy that adapts over time
+            if epoch < 6:  # Very subtle early attack to avoid detection
+                if random.random() < 0.2:  # 20% chance
+                    labels = (labels + 1) % 4
+            elif epoch < 15:  # Medium attack in middle rounds
+                if random.random() < 0.5:  # 50% chance
+                    labels = (labels + 1) % 4
+                if random.random() < 0.05:  # 5% chance of adding noise
+                    texts = texts.float()
+                    texts += torch.randn_like(texts) * 0.1
+                    texts = texts.clamp(0, len(dataset.vocab)-1).long()
+            else:  # Stronger attack in later rounds
+                # Adaptive strategy based on remaining population
+                if random.random() < 0.7:  # 70% chance
+                    labels = (labels + 2) % 4  # More disruptive flipping
+                if random.random() < 0.1:  # 10% chance of adding noise
+                    texts = texts.float()
+                    texts += torch.randn_like(texts) * 0.2
+                    texts = texts.clamp(0, len(dataset.vocab)-1).long()
+
+        optimizer.zero_grad()
+        outputs = model(texts, lengths)
+        loss = nn.NLLLoss()(outputs, labels)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 2.0)
+        gradients = [p.grad.clone() for p in model.parameters()]
+        optimizer.step()
+
+    return gradients
+
+# ========================
+# 5. Evaluation Metrics
+# ========================
+def calculate_metrics(server, removed_participants):
+    """Calculate detection performance metrics"""
+    y_true = np.array([1 if p['is_adversarial'] else 0 for p in server.participants])
+    y_pred = np.array([1 if i in removed_participants else 0 for i in range(len(server.participants))])
+    
+    # Handle edge cases
+    if sum(y_true) == 0 and sum(y_pred) == 0:
+        precision = 1.0
+    elif sum(y_pred) == 0:
+        precision = 0.0
+    else:
+        precision = precision_score(y_true, y_pred, zero_division=0)
+        
+    recall = recall_score(y_true, y_pred, zero_division=0) if sum(y_true) > 0 else 1.0
+    f1 = f1_score(y_true, y_pred, zero_division=0)
+    
+    # Confusion matrix
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+    if cm.shape == (2, 2):
+        tn, fp, fn, tp = cm.ravel()
+    else:
+        tn = cm[0, 0] if cm.shape[0] > 0 and cm.shape[1] > 0 else 0
+        fp = 0 if cm.shape[0] == 0 or cm.shape[1] <= 1 else cm[0, 1]
+        fn = 0 if cm.shape[0] <= 1 or cm.shape[1] == 0 else cm[1, 0]
+        tp = cm[1, 1] if cm.shape[0] > 1 and cm.shape[1] > 1 else 0
+    
+    return {
+        'accuracy': accuracy_score(y_true, y_pred) * 100,
+        'precision': precision * 100,
+        'recall': recall * 100,
+        'f1': f1 * 100,
+        'true_positives': tp,
+        'false_positives': fp,
+        'true_negatives': tn,
+        'false_negatives': fn,
+        'model_accuracy': np.mean(server.model_acc_history[-5:]) * 100 if server.model_acc_history else 0
+    }
+
+def print_detection_performance(metrics):
+    """Print detection performance metrics"""
+    print("\nDETECTION PERFORMANCE:")
+    print("--------------------------------------------------")
+    print(f"{'Accuracy:':<15}{metrics['accuracy']:.2f}%")
+    print(f"{'Precision:':<15}{metrics['precision']:.2f}%")
+    print(f"{'Recall:':<15}{metrics['recall']:.2f}%")
+    print(f"{'F1 Score:':<15}{metrics['f1']:.2f}%")
+    print(f"{'Model Acc (last 5):':<15}{metrics['model_accuracy']:.2f}%")
+    print("--------------------------------------------------")
+    print(f"{'True Positives:':<20}{metrics['true_positives']}")
+    print(f"{'False Positives:':<20}{metrics['false_positives']}")
+    print(f"{'True Negatives:':<20}{metrics['true_negatives']}")
+    print(f"{'False Negatives:':<20}{metrics['false_negatives']}")
+    print("--------------------------------------------------")
+
+def plot_results(server, removed_participants=None):
+    """Fixed plotting function to avoid alpha list error"""
+    plt.figure(figsize=(15, 10))
+    
+    # Plot 1: Participant Selection Rate
+    plt.subplot(2, 2, 1)
+    selection_rates = [p['selection_count'] / max(1, server.current_round) for p in server.participants]
+    colors = ['red' if p['is_adversarial'] else 'blue' for p in server.participants]
+    
+    # Plot honest participants
+    honest_indices = [i for i, p in enumerate(server.participants) if not p['is_adversarial']]
+    honest_rates = [selection_rates[i] for i in honest_indices]
+    honest_colors = [colors[i] for i in honest_indices]
+    honest_alphas = [0.4 if i in removed_participants else 0.8 for i in honest_indices]
+    
+    # Plot adversarial participants
+    adv_indices = [i for i, p in enumerate(server.participants) if p['is_adversarial']]
+    adv_rates = [selection_rates[i] for i in adv_indices]
+    adv_colors = [colors[i] for i in adv_indices]
+    adv_alphas = [0.4 if i in removed_participants else 0.8 for i in adv_indices]
+    
+    # Split into separate plots to avoid alpha list error
+    plt.bar(honest_indices, honest_rates, color='blue', alpha=0.8, label='Honest')
+    plt.bar(adv_indices, adv_rates, color='red', alpha=0.8, label='Adversarial')
+    
+    # Mark removed participants
+    for i in removed_participants:
+        plt.axvline(x=i, color='gray', linestyle='--', alpha=0.2)
+    
+    plt.title('Participant Selection Rate')
+    plt.xlabel('Participant ID')
+    plt.ylabel('Selection Rate')
+    plt.legend()
+    
+    # Plot 2: Model Accuracy
+    plt.subplot(2, 2, 2)
+    plt.plot(server.model_acc_history, 'g-')
+    
+    # Add a window average line
+    window_size = 3
+    if len(server.model_acc_history) >= window_size:
+        avg = []
+        for i in range(len(server.model_acc_history) - window_size + 1):
+            avg.append(np.mean(server.model_acc_history[i:i+window_size]))
+        
+        pad = [avg[0]] * (window_size - 1)
+        avg_smoothed = pad + avg
+        plt.plot(range(len(server.model_acc_history)), avg_smoothed, 'r-', label='Moving Average')
+    
+    # Mark rounds where participants were removed
+    removal_rounds = {}
+    for idx in removed_participants:
+        if server.participants[idx].get('removed_round') is not None:
+            r = server.participants[idx]['removed_round']
+            if r not in removal_rounds:
+                removal_rounds[r] = {'honest': 0, 'adv': 0}
+            
+            if server.participants[idx]['is_adversarial']:
+                removal_rounds[r]['adv'] += 1
+            else:
+                removal_rounds[r]['honest'] += 1
+    
+    # Plot removal events
+    for r, counts in removal_rounds.items():
+        if counts['honest'] > 0:
+            plt.axvline(x=r, color='blue', linestyle='--', alpha=0.3)
+        if counts['adv'] > 0:
+            plt.axvline(x=r, color='red', linestyle='--', alpha=0.3)
+    
+    plt.title('Global Model Accuracy')
+    plt.xlabel('Round')
+    plt.ylabel('Accuracy')
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    
+    # Plot 3: Participant Type Distribution
+    plt.subplot(2, 2, 3)
+    
+    # Count active vs removed for each type
+    active_honest = sum(1 for p in server.participants if not p['is_adversarial'] and p['active'])
+    active_adv = sum(1 for p in server.participants if p['is_adversarial'] and p['active'])
+    removed_honest = sum(1 for p in server.participants if not p['is_adversarial'] and not p['active'])
+    removed_adv = sum(1 for p in server.participants if p['is_adversarial'] and not p['active'])
+    
+    # Create stacked bar chart
+    labels = ['Honest', 'Adversarial']
+    active_counts = [active_honest, active_adv]
+    removed_counts = [removed_honest, removed_adv]
+    
+    width = 0.35
+    x = np.arange(len(labels))
+    
+    plt.bar(x, active_counts, width, label='Active', color='green')
+    plt.bar(x, removed_counts, width, bottom=active_counts, label='Removed', color='red')
+    
+    plt.title('Participant Status by Type')
+    plt.xlabel('Participant Type')
+    plt.ylabel('Count')
+    plt.xticks(x, labels)
+    plt.legend()
+    
+    # Plot 4: Confusion Matrix
+    plt.subplot(2, 2, 4)
+    y_true = np.array([1 if p['is_adversarial'] else 0 for p in server.participants])
+    active_status = np.array([0 if p['active'] else 1 for p in server.participants])
+    
+    cm = confusion_matrix(y_true, active_status)
+    plt.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
+    plt.title('Confusion Matrix')
+    plt.colorbar()
+    tick_marks = np.arange(2)
+    plt.xticks(tick_marks, ['Active', 'Removed'])
+    plt.yticks(tick_marks, ['Honest', 'Adversarial'])
+    
+    # Add text annotations
+    thresh = cm.max() / 2.
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            plt.text(j, i, format(cm[i, j], 'd'),
+                    ha="center", va="center",
+                    color="white" if cm[i, j] > thresh else "black")
+    
+    plt.tight_layout()
+    return plt.gcf()
+
+# ========================
+# 6. Complete Simulation
+# ========================
+def run_simulation(num_honest=10, num_adversarial=11, num_samples=10000, rounds=20):
+    """Run federated learning simulation with balanced detection"""
+    # Set random seeds
+    random.seed(42)
+    np.random.seed(42)
+    torch.manual_seed(42)
+    
+    # Create dataset and model
+    global dataset
+    dataset = AlphanumericDataset(num_samples=num_samples)
+    model = ImprovedClassifier(len(dataset.vocab))
+    
+    # Create split for train/validation
+    train_size = int(0.9 * len(dataset))
+    val_size = len(dataset) - train_size
+    
+    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+    val_loader = DataLoader(val_dataset, batch_size=64, collate_fn=collate_fn)
+    
+    # Initialize server
+    server = FederatedServer(model, num_honest, num_adversarial)
+    
+    # Now distribute data using indices - SIMPLIFIED APPROACH
+    indices = list(range(train_size))
+    random.shuffle(indices)
+    
+    # Split indices equally among all participants
+    samples_per_participant = len(indices) // len(server.participants)
+    
+    for i, participant in enumerate(server.participants):
+        start_idx = i * samples_per_participant
+        end_idx = min((i + 1) * samples_per_participant, len(indices))
+        participant_indices = indices[start_idx:end_idx]
+        
+        subset = Subset(train_dataset, participant_indices)
+        loader = DataLoader(subset, batch_size=32, collate_fn=collate_fn, shuffle=True)
+        participant['data'] = loader
+    
+    print(f"Starting FL with {num_honest} honest and {num_adversarial} adversarial participants")
+    print(f"Bootstrap rounds: {server.bootstrap_rounds}, Whitelist rounds: {server.whitelist_rounds}")
+    print(f"Removal threshold: {server.removal_threshold} MAD, Max removal rate: {server.max_removal_rate*100}%")
+    
+    removed_participants = []
+    for round in range(rounds):
+        gradients = []
+        active_indices = []
+        
+        # Train participants
+        for i, p in enumerate(server.participants):
+            if not p['active']:
+                continue
+                
+            grad = train_participant(
+                p['model'],
+                p['data'],
+                is_adversarial=p['is_adversarial'],
+                epoch=round
+            )
+            gradients.append(grad)
+            active_indices.append(i)
+        
+        # Update model
+        server.update_model(gradients, active_indices, val_loader)
+        
+        # Detect anomalies
+        candidates = server.detect_anomalies(active_indices)
+        
+        # Remove participants
+        if candidates:
+            honest_removed = sum(1 for idx in candidates if not server.participants[idx]['is_adversarial'])
+            adv_removed = len(candidates) - honest_removed
+            
+            for idx in candidates:
+                server.participants[idx]['active'] = False
+                server.participants[idx]['removed_round'] = round
+                removed_participants.append(idx)
+            
+            print(f"Round {round+1}: Removed {len(candidates)} participants "
+                  f"(Honest: {honest_removed}, Adversarial: {adv_removed})")
+            print(f"Current model accuracy: {server.model_acc_history[-1]:.2f}")
+        
+        # Progress update
+        if (round + 1) % 3 == 0 or round == 0:
+            active_honest = sum(1 for i in active_indices if not server.participants[i]['is_adversarial'])
+            active_adv = sum(1 for i in active_indices if server.participants[i]['is_adversarial'])
+            print(f"Round {round+1}: Active: {len(active_indices)} "
+                  f"(Honest: {active_honest}, Adversarial: {active_adv}), "
+                  f"Accuracy: {server.model_acc_history[-1]:.2f}")
+        
+        # Early stopping if too few participants remain
+        if len(active_indices) <= server.min_participants:
+            print(f"Stopping early at round {round+1} - minimum participant threshold reached")
+            break
+    
+    # Final evaluation
+    metrics = calculate_metrics(server, removed_participants)
+    print_detection_performance(metrics)
+    
+    # Print summary
+    total_honest = num_honest
+    total_adv = num_adversarial
+    removed_honest = sum(1 for idx in removed_participants if not server.participants[idx]['is_adversarial'])
+    removed_adv = sum(1 for idx in removed_participants if server.participants[idx]['is_adversarial'])
+    
+    print(f"\nFINAL RESULTS:")
+    print(f"Honest participants: {total_honest - removed_honest}/{total_honest} remaining "
+          f"({removed_honest/total_honest*100:.1f}% removed)")
+    print(f"Adversarial participants: {total_adv - removed_adv}/{total_adv} remaining "
+          f"({removed_adv/total_adv*100:.1f}% removed)")
+    print(f"Final model accuracy: {server.model_acc_history[-1]:.2f}")
+    
+    # Create visualization
+    fig = plot_results(server, removed_participants)
+    
+    return server, removed_participants, metrics, fig
+
+# ========================
+# 7. Analysis Functions
+# ========================
+def analyze_participant_behavior(server, removed_participants):
+    """Analyze participant behavior patterns"""
+    print("\nPARTICIPANT BEHAVIOR ANALYSIS:")
+    print("--------------------------------------------------")
+    
+    # Calculate selection frequency
+    honest_selection = []
+    adv_selection = []
+    
+    for i, p in enumerate(server.participants):
+        selection_rate = p['selection_count'] / max(1, server.current_round)
+        if p['is_adversarial']:
+            adv_selection.append(selection_rate)
+        else:
+            honest_selection.append(selection_rate)
+    
+    # Calculate outlier frequency
+    honest_outlier = [p['outlier_frequency'] for p in server.participants if not p['is_adversarial']]
+    adv_outlier = [p['outlier_frequency'] for p in server.participants if p['is_adversarial']]
+    
+    # Print summary stats
+    print(f"{'Average selection rate (honest):':<35}{np.mean(honest_selection):.3f}")
+    print(f"{'Average selection rate (adversarial):':<35}{np.mean(adv_selection):.3f}")
+    print(f"{'Average outlier frequency (honest):':<35}{np.mean(honest_outlier):.3f}")
+    print(f"{'Average outlier frequency (adversarial):':<35}{np.mean(adv_outlier):.3f}")
+    
+    # Calculate removal statistics
+    removed_honest_indices = [i for i in removed_participants if not server.participants[i]['is_adversarial']]
+    removed_adv_indices = [i for i in removed_participants if server.participants[i]['is_adversarial']]
+    
+    # Analyze when participants were removed
+    early_rounds = server.whitelist_rounds + 1
+    mid_round = (server.current_round + server.whitelist_rounds) // 2
+    late_rounds = mid_round + 1
+    
+    early_removed_honest = sum(1 for i in removed_honest_indices 
+                           if server.participants[i].get('removed_round') is not None 
+                           and server.participants[i]['removed_round'] < early_rounds)
+                           
+    early_removed_adv = sum(1 for i in removed_adv_indices 
+                         if server.participants[i].get('removed_round') is not None 
+                         and server.participants[i]['removed_round'] < early_rounds)
+                         
+    mid_removed_honest = sum(1 for i in removed_honest_indices 
+                          if server.participants[i].get('removed_round') is not None 
+                          and early_rounds <= server.participants[i]['removed_round'] < late_rounds)
+                          
+    mid_removed_adv = sum(1 for i in removed_adv_indices 
+                        if server.participants[i].get('removed_round') is not None 
+                        and early_rounds <= server.participants[i]['removed_round'] < late_rounds)
+                        
+    late_removed_honest = sum(1 for i in removed_honest_indices 
+                           if server.participants[i].get('removed_round') is not None 
+                           and server.participants[i]['removed_round'] >= late_rounds)
+                           
+    late_removed_adv = sum(1 for i in removed_adv_indices 
+                         if server.participants[i].get('removed_round') is not None 
+                         and server.participants[i]['removed_round'] >= late_rounds)
+    
+    print("\nREMOVAL PATTERNS:")
+    print(f"{'Early removals (rounds <= '+str(early_rounds)+')':<40}")
+    print(f"{'   Honest:':<15}{early_removed_honest}")
+    print(f"{'   Adversarial:':<15}{early_removed_adv}")
+    
+    print(f"{'Mid removals (rounds '+str(early_rounds+1)+'-'+str(late_rounds-1)+')':<40}")
+    print(f"{'   Honest:':<15}{mid_removed_honest}")
+    print(f"{'   Adversarial:':<15}{mid_removed_adv}")
+    
+    print(f"{'Late removals (rounds >= '+str(late_rounds)+')':<40}")
+    print(f"{'   Honest:':<15}{late_removed_honest}")
+    print(f"{'   Adversarial:':<15}{late_removed_adv}")
+    
+    return {
+        'honest_selection': honest_selection,
+        'adv_selection': adv_selection,
+        'honest_outlier': honest_outlier,
+        'adv_outlier': adv_outlier,
+        'early_removed': {'honest': early_removed_honest, 'adv': early_removed_adv},
+        'mid_removed': {'honest': mid_removed_honest, 'adv': mid_removed_adv},
+        'late_removed': {'honest': late_removed_honest, 'adv': late_removed_adv}
+    }
+    
+# ========================
+# 8. Main Execution
+# ========================
+if __name__ == "__main__":
+    device = torch.device('cpu')  # Force CPU for compatibility
+    print(f"Using device: {device}")
+    
+    # Run improved simulation with adversarial majority
+    server, removed, metrics, fig = run_simulation(
+        num_honest=10,      # Large-scale test
+        num_adversarial=11, # Adversarial majority
+        num_samples=30000,   # Reasonable sample size
+        rounds=100            # More rounds for convergence
+    )
+    
+    # Perform additional analysis
+    behavior_metrics = analyze_participant_behavior(server, removed)
+    
+    # Save results
+    plt.figure(fig.number)
+    plt.savefig('fl_simulation_results.png', bbox_inches='tight')
+    plt.close(fig)
+
+    print(f"\nSimulation completed. Results saved to fl_simulation_results.png")
+    print(f"Detection F1 score: {metrics['f1']:.2f}%")
+    print(f"Final model accuracy: {metrics['model_accuracy']:.2f}%")
