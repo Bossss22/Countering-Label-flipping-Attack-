@@ -1,0 +1,1196 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, random_split, Subset, TensorDataset
+import random
+import string
+import copy
+import numpy as np
+import pandas as pd
+from collections import defaultdict
+import matplotlib.pyplot as plt
+from sklearn.metrics import confusion_matrix, precision_score, recall_score, f1_score, accuracy_score
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+
+# ========================
+# 1. V2G Dataset Implementation
+# ========================
+class V2GDataset(Dataset):
+    def __init__(self, csv_file):
+        # Load CSV file
+        self.data = pd.read_csv(csv_file)
+        
+        # Print dataset info
+        print(f"Dataset loaded with {len(self.data)} records")
+        print(f"Columns: {', '.join(self.data.columns)}")
+        
+        # Preprocess timestamps if needed
+        # Convert timestamp to datetime if it's not already
+        if 'timestamp' in self.data.columns and not pd.api.types.is_datetime64_any_dtype(self.data['timestamp']):
+            self.data['timestamp'] = pd.to_datetime(self.data['timestamp'])
+            # Extract hour as a feature
+            self.data['hour'] = self.data['timestamp'].dt.hour
+        
+        # Encode labels if they're categorical
+        if 'label' in self.data.columns and self.data['label'].dtype == 'object':
+            self.label_encoder = LabelEncoder()
+            self.data['label_encoded'] = self.label_encoder.fit_transform(self.data['label'])
+            print(f"Label classes: {', '.join(self.label_encoder.classes_)}")
+        else:
+            # If no label column, create a dummy one (all zeros)
+            self.data['label_encoded'] = 0
+            
+        # Extract numerical features
+        self.feature_columns = ['battery_capacity_kWh', 'current_charge_kWh', 
+                               'discharge_rate_kW', 'energy_requested_kWh']
+        
+        if 'hour' in self.data.columns:
+            self.feature_columns.append('hour')
+        
+        # Scale features
+        self.scaler = StandardScaler()
+        self.data[self.feature_columns] = self.scaler.fit_transform(self.data[self.feature_columns])
+        
+        # Group by participant_id to allow data distribution
+        self.participant_groups = self.data.groupby('participant_id')
+        self.participant_ids = list(self.participant_groups.groups.keys())
+        
+        print(f"Found {len(self.participant_ids)} unique participants")
+        
+        # Count honest vs adversarial if label exists
+        if 'label' in self.data.columns:
+            honest_count = len(self.data[self.data['label'].str.contains('honest', case=False, na=False)])
+            adv_count = len(self.data) - honest_count
+            print(f"Data distribution: {honest_count} honest, {adv_count} adversarial records")
+            
+            # Count unique participants of each type
+            participant_types = {}
+            for p_id in self.participant_ids:
+                labels = self.data[self.data['participant_id'] == p_id]['label'].unique()
+                if len(labels) > 0:
+                    participant_types[p_id] = 'adversarial' if 'adv' in labels[0].lower() else 'honest'
+            
+            honest_p = sum(1 for p_type in participant_types.values() if p_type == 'honest')
+            adv_p = sum(1 for p_type in participant_types.values() if p_type == 'adversarial')
+            print(f"Participant distribution: {honest_p} honest, {adv_p} adversarial participants")
+        
+        # Extract features and labels as tensors
+        self.features = torch.tensor(self.data[self.feature_columns].values, dtype=torch.float32)
+        self.labels = torch.tensor(self.data['label_encoded'].values, dtype=torch.long)
+        
+        # Get number of features and classes
+        self.num_features = len(self.feature_columns)
+        self.num_classes = len(self.data['label_encoded'].unique())
+        
+        print(f"Features: {self.num_features}, Classes: {self.num_classes}")
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        # Return feature vector and label
+        return self.features[idx], self.labels[idx]
+    
+    def get_participant_data(self, participant_id):
+        """Get data for a specific participant"""
+        if participant_id in self.participant_ids:
+            indices = self.participant_groups.get_group(participant_id).index.tolist()
+            features = self.features[indices]
+            labels = self.labels[indices]
+            return features, labels
+        return None, None
+    
+    def get_participant_indices(self, participant_id):
+        """Get indices for a specific participant"""
+        if participant_id in self.participant_ids:
+            return self.participant_groups.get_group(participant_id).index.tolist()
+        return []
+        
+    def get_participant_type(self, participant_id):
+        """Get type (honest/adversarial) for a participant"""
+        if participant_id in self.participant_ids and 'label' in self.data.columns:
+            labels = self.data[self.data['participant_id'] == participant_id]['label'].unique()
+            if len(labels) > 0:
+                return 'adversarial' if 'adv' in labels[0].lower() else 'honest'
+        return "unknown"
+
+# ========================
+# 2. V2G Model with LayerNorm
+# ========================
+class V2GClassifier(nn.Module):
+    def __init__(self, input_size, hidden_size=64, num_classes=2, dropout=0.2):
+        super().__init__()
+        self.fc1 = nn.Linear(input_size, hidden_size)
+        # Using LayerNorm instead of BatchNorm - works with any batch size
+        self.norm1 = nn.LayerNorm(hidden_size)
+        self.dropout1 = nn.Dropout(dropout)
+        
+        self.fc2 = nn.Linear(hidden_size, hidden_size)
+        self.norm2 = nn.LayerNorm(hidden_size)
+        self.dropout2 = nn.Dropout(dropout)
+        
+        self.fc3 = nn.Linear(hidden_size, num_classes)
+        
+    def forward(self, x):
+        # First layer with ReLU and layer norm
+        x = self.fc1(x)
+        x = self.norm1(x)  # Layer norm works with batch size of 1
+        x = torch.relu(x)
+        x = self.dropout1(x)
+        
+        # Second hidden layer
+        x = self.fc2(x)
+        x = self.norm2(x)  # Layer norm works with batch size of 1
+        x = torch.relu(x)
+        x = self.dropout2(x)
+        
+        # Output layer
+        x = self.fc3(x)
+        return torch.log_softmax(x, dim=1)
+
+# ========================
+# 3. Robust Federated Learning Server
+# ========================
+class FederatedServer:
+    def __init__(self, global_model, num_honest, num_adversarial):
+        self.global_model = global_model
+        self.participants = []
+        self.total_participants = num_honest + num_adversarial
+        
+        # Parameters for robust aggregation - adjusted for adversarial majority
+        if num_adversarial > num_honest:
+            # Adjusted parameters for when adversaries outnumber honest
+            self.num_byzantines = max(1, min(num_adversarial, num_honest*2))  # Conservative Byzantine estimate
+            self.multi_krum_m = max(3, num_honest // 3)  # Select fewer, higher quality updates
+            
+            # More aggressive detection
+            self.removal_threshold = 2.8  # Lower threshold for detection
+            self.max_removal_rate = 0.15  # Higher removal rate per round
+            self.bootstrap_rounds = 3  # Shorter bootstrap period
+            self.whitelist_rounds = 3  # Shorter whitelist
+            self.selection_protection = 0.4  # Higher protection for frequently selected
+        else:
+            # Standard parameters 
+            self.num_byzantines = min(num_adversarial, num_honest//2)
+            self.multi_krum_m = max(3, num_honest // 2)
+            self.removal_threshold = 3.5
+            self.max_removal_rate = 0.1
+            self.bootstrap_rounds = 5
+            self.whitelist_rounds = 6
+            self.selection_protection = 0.3
+        
+        self.current_round = 0
+        
+        # Additional protections
+        self.min_participants = max(5, num_honest // 10)  # Ensure enough participants remain
+        self.honest_protection_factor = 2.0  # Make it harder to remove honest participants
+        
+        # Tracking
+        self.score_history = defaultdict(list)
+        self.reputation_history = [torch.ones(self.total_participants)]
+        self.model_acc_history = []
+        self.selection_history = defaultdict(list)
+        
+        # Initialize participants
+        participant_types = [False]*num_honest + [True]*num_adversarial
+        random.shuffle(participant_types)
+        
+        for i, is_adv in enumerate(participant_types):
+            self.participants.append({
+                'id': i,
+                'model': copy.deepcopy(global_model),
+                'data': None,
+                'is_adversarial': is_adv,
+                'active': True,
+                'scores': [],
+                'selection_count': 0,
+                'outlier_frequency': 0,
+                'removed_round': None
+            })
+        
+        print(f"Server initialized with {num_honest} honest and {num_adversarial} adversarial participants")
+        print(f"Detection params: threshold={self.removal_threshold}, rate={self.max_removal_rate}")
+        print(f"Multi-Krum params: byzantines={self.num_byzantines}, m={self.multi_krum_m}")
+
+    def multi_krum(self, gradients, active_indices):
+        """Enhanced Multi-Krum for adversarial majority scenarios"""
+        valid_grads = []
+        valid_indices = []
+        
+        for i, idx in enumerate(active_indices):
+            if gradients[i] is not None:
+                valid_grads.append(gradients[i])
+                valid_indices.append(idx)
+                
+        if not valid_grads:
+            return [], [], None
+        
+        # Flatten gradients
+        flat_grads = [torch.cat([g.view(-1) for g in grad]) for grad in valid_grads]
+        
+        # Filter extreme gradient norms
+        grad_norms = [torch.norm(g).item() for g in flat_grads]
+        median_norm = np.median(grad_norms)
+        extreme_threshold = 3.0
+        
+        filtered_grads = []
+        filtered_indices = []
+        
+        for i, (norm, idx) in enumerate(zip(grad_norms, valid_indices)):
+            rel_dev = abs(norm - median_norm) / (median_norm + 1e-10)
+            if rel_dev < extreme_threshold:
+                filtered_grads.append(flat_grads[i])
+                filtered_indices.append(idx)
+        
+        if len(filtered_grads) < 3:  # If too many filtered, revert to original
+            filtered_grads = flat_grads
+            filtered_indices = valid_indices
+        
+        # Compute distances with filtered gradients
+        n = len(filtered_grads)
+        distances = torch.zeros((n, n))
+        
+        for i in range(n):
+            for j in range(i+1, n):
+                dist = torch.sum((filtered_grads[i] - filtered_grads[j])**2).item()
+                distances[i,j] = distances[j,i] = dist
+        
+        # Compute scores
+        krum_scores = torch.zeros(n)
+        
+        # Dynamically adjust f based on active participants
+        active_honest = sum(1 for i in active_indices if not self.participants[i]['is_adversarial'])
+        active_adv = len(active_indices) - active_honest
+        
+        # When adversaries might be majority, be more conservative
+        if active_adv >= active_honest:
+            f = min(active_adv // 2, n-2)  # More conservative estimate
+        else:
+            f = min(self.num_byzantines, n-2)
+        
+        # Must have f < n-2
+        if f >= n-1:
+            f = n-2 if n > 2 else 0
+        
+        for i in range(n):
+            dist_i = distances[i]
+            neighbor_distances, _ = torch.sort(dist_i)
+            # Handle edge case when f is 0
+            if f > 0:
+                krum_scores[i] = torch.sum(neighbor_distances[1:n-f])
+            else:
+                krum_scores[i] = torch.sum(neighbor_distances[1:])
+        
+        # Select top m gradients
+        _, sorted_indices = torch.sort(krum_scores)
+        m = min(self.multi_krum_m, n)
+        selected_indices_local = sorted_indices[:m].tolist()
+        selected_indices = [filtered_indices[i] for i in selected_indices_local]
+        
+        # Improved aggregation: weighted mean
+        selected_grads = [filtered_grads[i] for i in selected_indices_local]
+        selected_scores = [krum_scores[i].item() for i in selected_indices_local]
+        
+        # Inverse weighting - lower scores get higher weights
+        if len(selected_grads) >= 3:
+            max_score = max(selected_scores)
+            weights = [max(0.1, (max_score - score + 1e-5) / (max_score + 1e-5)) for score in selected_scores]
+            total_weight = sum(weights)
+            weights = [w / total_weight for w in weights]
+            
+            # Weighted average
+            aggregated = torch.zeros_like(selected_grads[0])
+            for i, grad in enumerate(selected_grads):
+                aggregated += grad * weights[i]
+        else:
+            # Simple mean for small selection
+            aggregated = torch.stack(selected_grads).mean(dim=0)
+        
+        # Prepare scores
+        all_scores = [None] * len(gradients)
+        for i, idx in enumerate(filtered_indices):
+            loc = active_indices.index(idx)
+            all_scores[loc] = krum_scores[i].item()
+        
+        return selected_indices, all_scores, aggregated
+
+    def detect_anomalies(self, active_indices):
+        """Conservative anomaly detection to protect honest participants"""
+        # No removal during whitelist period or if too few participants
+        if (self.current_round <= self.whitelist_rounds or 
+            len(active_indices) <= self.min_participants):
+            return []
+            
+        anomalies = []
+        if len(active_indices) < 5:
+            return anomalies
+        
+        # Get historical data for analysis
+        historical_data = {}
+        for idx in active_indices:
+            if len(self.score_history[idx]) >= 3:
+                # Get recent scores
+                recent_scores = [s for s in self.score_history[idx][-3:] if s is not None]
+                if not recent_scores:
+                    continue
+                    
+                # Calculate selection rate - a crucial metric
+                selection_rate = self.participants[idx]['selection_count'] / max(1, self.current_round)
+                # Track selection history for this participant
+                self.selection_history[idx].append(selection_rate)
+                
+                # Calculate consistency metrics
+                if len(recent_scores) >= 2:
+                    trend = recent_scores[-1] - recent_scores[0]
+                    variation = np.std(recent_scores) / (np.mean(recent_scores) + 1e-10)
+                else:
+                    trend = 0.0
+                    variation = 0.0
+                
+                # Protection score - higher means more likely to be honest
+                protection_score = selection_rate * self.honest_protection_factor
+                
+                # Store metrics for this participant
+                historical_data[idx] = {
+                    'raw_score': np.mean(recent_scores),
+                    'selection_rate': selection_rate,
+                    'trend': trend,
+                    'variation': variation,
+                    'protection_score': protection_score
+                }
+        
+        if not historical_data:
+            return anomalies
+            
+        # Compute robust statistics
+        raw_scores = [info['raw_score'] for info in historical_data.values() if info['raw_score'] is not None]
+        if not raw_scores:
+            return anomalies
+            
+        median_score = np.median(raw_scores)
+        mad = np.median([abs(s - median_score) for s in raw_scores]) + 1e-10
+        
+        # Determine removals with strong protections for honest participants
+        candidates = []
+        
+        for idx, info in historical_data.items():
+            # Calculate z-score (deviation from median in MAD units)
+            z_score = (info['raw_score'] - median_score) / mad
+            
+            # Apply protection based on selection rate
+            # Frequently selected participants are likely honest
+            if info['selection_rate'] >= self.selection_protection:
+                continue  # Skip frequently selected participants
+                
+            # Calculate combined anomaly score
+            anomaly_score = z_score - info['protection_score']
+            
+            # Only consider participants that exceed threshold
+            if anomaly_score > self.removal_threshold:
+                candidates.append((anomaly_score, idx))
+        
+        # Sort candidates and apply removal rate limit
+        candidates.sort(reverse=True)
+        
+        # More restrictive limit as training progresses
+        progress_factor = 0.7 ** (self.current_round // 5)
+        
+        # When adversaries outnumber honest, be more aggressive early, more conservative late
+        if len(self.participants) > 0:
+            adv_ratio = sum(1 for p in self.participants if p['is_adversarial']) / len(self.participants)
+            if adv_ratio > 0.5:  # Adversarial majority
+                if self.current_round < 10:
+                    progress_factor = 1.2  # More aggressive early
+                else:
+                    progress_factor = 0.5  # More conservative later
+        
+        max_removals = min(3, max(1, int(len(active_indices) * self.max_removal_rate * progress_factor)))
+        
+        # Do not remove too many participants in later rounds
+        if self.current_round > 15 and len(candidates) > 0:
+            max_removals = 1
+            
+        anomalies = [idx for _, idx in candidates[:max_removals]]
+        
+        return anomalies
+
+    def update_model(self, gradients, active_indices, val_loader=None):
+        """Update model with aggregated gradients"""
+        self.current_round += 1
+        
+        # Apply Multi-Krum
+        selected_indices, krum_scores, aggregated = self.multi_krum(gradients, active_indices)
+        
+        # Dynamic step size scheduling
+        if self.current_round < 5:
+            step_size = 0.05  # Conservative early on
+        elif self.current_round < 10:
+            step_size = 0.08  # Medium
+        else:
+            step_size = 0.10  # Standard
+            
+        # Update global model
+        if aggregated is not None:
+            idx = 0
+            for param in self.global_model.parameters():
+                param_size = param.numel()
+                grad_portion = aggregated[idx:idx+param_size].view(param.shape)
+                with torch.no_grad():
+                    param -= grad_portion * step_size
+                idx += param_size
+        
+        # Update selection counts and score history
+        for i, idx in enumerate(active_indices):
+            if i < len(krum_scores) and krum_scores[i] is not None:
+                self.score_history[idx].append(krum_scores[i])
+                
+                if idx in selected_indices:
+                    self.participants[idx]['selection_count'] += 1
+        
+        # Calculate outlier frequency
+        for idx in active_indices:
+            if len(self.score_history[idx]) >= 3:
+                scores = [s for s in self.score_history[idx] if s is not None]
+                if not scores:
+                    continue
+                    
+                all_scores = [s for participant_scores in self.score_history.values() 
+                             for s in participant_scores if s is not None]
+                if all_scores:
+                    median_all = np.median(all_scores)
+                    mad_all = np.median([abs(s - median_all) for s in all_scores]) + 1e-10
+                    outlier_count = sum(1 for s in scores if abs(s - median_all) > 1.5 * mad_all)
+                    self.participants[idx]['outlier_frequency'] = outlier_count / len(scores)
+        
+        # Evaluate and track model accuracy
+        if val_loader:
+            current_acc = self.evaluate_model(val_loader)
+            self.model_acc_history.append(current_acc)
+        
+        return selected_indices, krum_scores
+
+    def evaluate_model(self, data_loader, model=None):
+        """Evaluate model accuracy"""
+        model_to_eval = model if model is not None else self.global_model
+        model_to_eval.eval()
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            for features, labels in data_loader:
+                # Force device to CPU for compatibility
+                features, labels = features.to('cpu'), labels.to('cpu')
+                outputs = model_to_eval(features)
+                _, predicted = torch.max(outputs.data, 1)
+                total += labels.size(0)
+                correct += (predicted == labels).sum().item()
+        return correct / total if total > 0 else 0
+
+# ========================
+# 4. V2G Adversarial Training
+# ========================
+def train_participant(model, data_loader, is_adversarial=False, epoch=0):
+    """Training function with V2G-specific adversarial behavior"""
+    # Dynamic learning rate
+    if epoch < 3:
+        lr = 0.005  # Start conservative
+    elif epoch < 8:
+        lr = 0.01   # Standard rate
+    else:
+        lr = 0.007  # Decrease slightly for stability
+        
+    optimizer = optim.SGD(model.parameters(), lr=lr, momentum=0.9)
+    model.train()
+    gradients = []
+
+    for features, labels in data_loader:
+        # Force device to CPU for compatibility
+        features, labels = features.to('cpu'), labels.to('cpu')
+
+        if is_adversarial:
+            # V2G-specific adversarial behavior
+            if epoch < 6:  # Subtle early attacks
+                # Occasional label flipping (20% chance)
+                if random.random() < 0.2:
+                    labels = (labels + 1) % dataset.num_classes
+            elif epoch < 15:  # Medium attacks
+                # More frequent label flipping (50% chance)
+                if random.random() < 0.5:
+                    labels = (labels + 1) % dataset.num_classes
+                
+                # Occasional data poisoning (5% chance)
+                if random.random() < 0.05:
+                    noise = torch.randn_like(features) * 0.1
+                    features = features + noise
+            else:  # Strong attacks
+                # Strategic label manipulation (70% chance)
+                if random.random() < 0.7:
+                    labels = (labels + 2) % dataset.num_classes
+                
+                # More aggressive data poisoning (10% chance)
+                if random.random() < 0.1:
+                    noise = torch.randn_like(features) * 0.2
+                    features = features + noise
+
+        optimizer.zero_grad()
+        outputs = model(features)
+        loss = nn.NLLLoss()(outputs, labels)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 2.0)
+        gradients = [p.grad.clone() for p in model.parameters()]
+        optimizer.step()
+
+    return gradients
+
+# ========================
+# 5. Evaluation Metrics
+# ========================
+def calculate_metrics(server, removed_participants):
+    """Calculate detection performance metrics"""
+    y_true = np.array([1 if p['is_adversarial'] else 0 for p in server.participants])
+    y_pred = np.array([1 if i in removed_participants else 0 for i in range(len(server.participants))])
+    
+    # Handle edge cases
+    if sum(y_true) == 0 and sum(y_pred) == 0:
+        precision = 1.0
+    elif sum(y_pred) == 0:
+        precision = 0.0
+    else:
+        precision = precision_score(y_true, y_pred, zero_division=0)
+        
+    recall = recall_score(y_true, y_pred, zero_division=0) if sum(y_true) > 0 else 1.0
+    f1 = f1_score(y_true, y_pred, zero_division=0)
+    
+    # Confusion matrix
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+    if cm.shape == (2, 2):
+        tn, fp, fn, tp = cm.ravel()
+    else:
+        tn = cm[0, 0] if cm.shape[0] > 0 and cm.shape[1] > 0 else 0
+        fp = 0 if cm.shape[0] == 0 or cm.shape[1] <= 1 else cm[0, 1]
+        fn = 0 if cm.shape[0] <= 1 or cm.shape[1] == 0 else cm[1, 0]
+        tp = cm[1, 1] if cm.shape[0] > 1 and cm.shape[1] > 1 else 0
+    
+    return {
+        'accuracy': accuracy_score(y_true, y_pred) * 100,
+        'precision': precision * 100,
+        'recall': recall * 100,
+        'f1': f1 * 100,
+        'true_positives': tp,
+        'false_positives': fp,
+        'true_negatives': tn,
+        'false_negatives': fn,
+        'model_accuracy': np.mean(server.model_acc_history[-5:]) * 100 if server.model_acc_history else 0
+    }
+
+def print_detection_performance(metrics):
+    """Print detection performance metrics"""
+    print("\nDETECTION PERFORMANCE:")
+    print("--------------------------------------------------")
+    print(f"{'Accuracy:':<15}{metrics['accuracy']:.2f}%")
+    print(f"{'Precision:':<15}{metrics['precision']:.2f}%")
+    print(f"{'Recall:':<15}{metrics['recall']:.2f}%")
+    print(f"{'F1 Score:':<15}{metrics['f1']:.2f}%")
+    print(f"{'Model Acc (last 5):':<15}{metrics['model_accuracy']:.2f}%")
+    print("--------------------------------------------------")
+    print(f"{'True Positives:':<20}{metrics['true_positives']}")
+    print(f"{'False Positives:':<20}{metrics['false_positives']}")
+    print(f"{'True Negatives:':<20}{metrics['true_negatives']}")
+    print(f"{'False Negatives:':<20}{metrics['false_negatives']}")
+    print("--------------------------------------------------")
+
+def plot_results(server, removed_participants=None):
+    """Plot federated learning results for V2G"""
+    plt.figure(figsize=(15, 10))
+    
+    # Plot 1: Participant Selection Rate
+    plt.subplot(2, 2, 1)
+    selection_rates = [p['selection_count'] / max(1, server.current_round) for p in server.participants]
+    
+    # Plot honest participants
+    honest_indices = [i for i, p in enumerate(server.participants) if not p['is_adversarial']]
+    honest_rates = [selection_rates[i] for i in honest_indices]
+    
+    # Plot adversarial participants
+    adv_indices = [i for i, p in enumerate(server.participants) if p['is_adversarial']]
+    adv_rates = [selection_rates[i] for i in adv_indices]
+    
+    # Split into separate plots to avoid alpha list error
+    plt.bar(honest_indices, honest_rates, color='blue', alpha=0.8, label='Honest')
+    plt.bar(adv_indices, adv_rates, color='red', alpha=0.8, label='Adversarial')
+    
+    # Mark removed participants
+    if removed_participants:
+        for i in removed_participants:
+            plt.axvline(x=i, color='gray', linestyle='--', alpha=0.2)
+    
+    plt.title('V2G Participant Selection Rate')
+    plt.xlabel('Participant ID')
+    plt.ylabel('Selection Rate')
+    plt.legend()
+    
+    # Plot 2: Model Accuracy
+    plt.subplot(2, 2, 2)
+    plt.plot(server.model_acc_history, 'g-')
+    
+    # Add a window average line
+    window_size = 3
+    if len(server.model_acc_history) >= window_size:
+        avg = []
+        for i in range(len(server.model_acc_history) - window_size + 1):
+            avg.append(np.mean(server.model_acc_history[i:i+window_size]))
+        
+        pad = [avg[0]] * (window_size - 1)
+        avg_smoothed = pad + avg
+        plt.plot(range(len(server.model_acc_history)), avg_smoothed, 'r-', label='Moving Average')
+    
+    # Mark rounds where participants were removed
+    removal_rounds = {}
+    if removed_participants:
+        for idx in removed_participants:
+            if server.participants[idx].get('removed_round') is not None:
+                r = server.participants[idx]['removed_round']
+                if r not in removal_rounds:
+                    removal_rounds[r] = {'honest': 0, 'adv': 0}
+                
+                if server.participants[idx]['is_adversarial']:
+                    removal_rounds[r]['adv'] += 1
+                else:
+                    removal_rounds[r]['honest'] += 1
+    
+    # Plot removal events
+    for r, counts in removal_rounds.items():
+        if counts['honest'] > 0:
+            plt.axvline(x=r, color='blue', linestyle='--', alpha=0.3)
+        if counts['adv'] > 0:
+            plt.axvline(x=r, color='red', linestyle='--', alpha=0.3)
+    
+    plt.title('V2G Model Accuracy')
+    plt.xlabel('Round')
+    plt.ylabel('Accuracy')
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    
+    # Plot 3: Participant Type Distribution
+    plt.subplot(2, 2, 3)
+    
+    # Count active vs removed for each type
+    active_honest = sum(1 for p in server.participants if not p['is_adversarial'] and p['active'])
+    active_adv = sum(1 for p in server.participants if p['is_adversarial'] and p['active'])
+    removed_honest = sum(1 for p in server.participants if not p['is_adversarial'] and not p['active'])
+    removed_adv = sum(1 for p in server.participants if p['is_adversarial'] and not p['active'])
+    
+    # Create stacked bar chart
+    labels = ['Honest', 'Adversarial']
+    active_counts = [active_honest, active_adv]
+    removed_counts = [removed_honest, removed_adv]
+    
+    width = 0.35
+    x = np.arange(len(labels))
+    
+    plt.bar(x, active_counts, width, label='Active', color='green')
+    plt.bar(x, removed_counts, width, bottom=active_counts, label='Removed', color='red')
+    
+    plt.title('V2G Participant Status by Type')
+    plt.xlabel('Participant Type')
+    plt.ylabel('Count')
+    plt.xticks(x, labels)
+    plt.legend()
+    
+    # Plot 4: Confusion Matrix
+    plt.subplot(2, 2, 4)
+    y_true = np.array([1 if p['is_adversarial'] else 0 for p in server.participants])
+    active_status = np.array([0 if p['active'] else 1 for p in server.participants])
+    
+    cm = confusion_matrix(y_true, active_status)
+    plt.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
+    plt.title('Confusion Matrix')
+    plt.colorbar()
+    tick_marks = np.arange(2)
+    plt.xticks(tick_marks, ['Active', 'Removed'])
+    plt.yticks(tick_marks, ['Honest', 'Adversarial'])
+    
+    # Add text annotations
+    thresh = cm.max() / 2.
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            plt.text(j, i, format(cm[i, j], 'd'),
+                    ha="center", va="center",
+                    color="white" if cm[i, j] > thresh else "black")
+    
+    plt.tight_layout()
+    return plt.gcf()
+
+# ========================
+# 6. Improved Data Distribution
+# ========================
+def distribute_data_to_participants(dataset, train_indices, server, min_samples=5):
+    """Ensure minimum samples per participant"""
+    # Get participant IDs if available
+    if 'participant_id' in dataset.data.columns:
+        # Use actual participant IDs from the dataset
+        unique_participant_ids = dataset.data['participant_id'].unique()
+        
+        # Check if we have enough participants in the dataset
+        if len(unique_participant_ids) >= server.total_participants:
+            # Sample participant IDs for our simulation
+            selected_participant_ids = np.random.choice(
+                unique_participant_ids, 
+                server.total_participants, 
+                replace=False
+            )
+            
+            # Count active participants
+            active_count = 0
+            
+            # Assign data
+            for i, p in enumerate(server.participants):
+                dataset_participant_id = selected_participant_ids[i]
+                participant_indices = [idx for idx in train_indices 
+                                     if idx in dataset.get_participant_indices(dataset_participant_id)]
+                
+                # Ensure minimum samples
+                if len(participant_indices) >= min_samples:
+                    subset = Subset(dataset, participant_indices)
+                    # Ensure batch size doesn't exceed dataset size but is at least 2
+                    batch_size = min(len(participant_indices), max(2, len(participant_indices)//5))
+                    loader = DataLoader(subset, batch_size=batch_size, shuffle=True)
+                    p['data'] = loader
+                    active_count += 1
+                else:
+                    # Not enough data, mark as inactive
+                    p['active'] = False
+                    p['data'] = None
+                    
+            print(f"Activated {active_count}/{server.total_participants} participants with real data")
+            return
+    
+    # If we get here, either no participant_id or not enough participants
+    # Fallback to random assignment with minimum sample guarantee
+    samples_per_participant = max(min_samples, len(train_indices) // server.total_participants)
+    
+    # If we can't give minimum samples to all participants, reduce participant count
+    if samples_per_participant * server.total_participants > len(train_indices):
+        max_participants = len(train_indices) // min_samples
+        print(f"Warning: Not enough data for all participants. Limiting to {max_participants}")
+        
+        # Deactivate excess participants
+        active_honest = 0
+        active_adv = 0
+        
+        # Try to maintain ratio but ensure at least some of each type
+        for i, p in enumerate(server.participants):
+            if not p['is_adversarial'] and active_honest < max_participants // 2:
+                active_honest += 1
+            elif p['is_adversarial'] and active_adv < max_participants // 2:
+                active_adv += 1
+            else:
+                p['active'] = False
+                p['data'] = None
+                
+        print(f"Activated {active_honest} honest and {active_adv} adversarial participants")
+    
+    # Distribute data to active participants
+    active_indices = [i for i, p in enumerate(server.participants) if p['active']]
+    total_active = len(active_indices)
+    
+    # Shuffle indices
+    random.shuffle(train_indices)
+    
+    # Distribute evenly
+    for i, p_idx in enumerate(active_indices):
+        start_idx = i * samples_per_participant
+        end_idx = min((i + 1) * samples_per_participant, len(train_indices))
+        p_indices = train_indices[start_idx:end_idx]
+        
+        subset = Subset(dataset, p_indices)
+        # Ensure batch size doesn't exceed dataset size
+        batch_size = min(len(p_indices), max(2, len(p_indices)//5))
+        loader = DataLoader(subset, batch_size=batch_size, shuffle=True)
+        server.participants[p_idx]['data'] = loader
+
+# ========================
+# 7. V2G Federated Learning Simulation
+# ========================
+def run_v2g_simulation(dataset_path, num_honest=10, num_adversarial=11, rounds=20):
+    """Run federated learning simulation with V2G data"""
+    # Set random seeds
+    random.seed(42)
+    np.random.seed(42)
+    torch.manual_seed(42)
+    
+    # Create dataset and model
+    global dataset
+    dataset = V2GDataset(dataset_path)
+    
+    # Create model based on dataset features
+    model = V2GClassifier(
+        input_size=dataset.num_features,
+        hidden_size=64,
+        num_classes=dataset.num_classes
+    )
+    
+    # Create split for train/validation
+    indices = list(range(len(dataset)))
+    random.shuffle(indices)
+    train_size = int(0.9 * len(dataset))
+    val_size = len(dataset) - train_size
+    
+    train_indices = indices[:train_size]
+    val_indices = indices[train_size:]
+    
+    train_dataset = Subset(dataset, train_indices)
+    val_dataset = Subset(dataset, val_indices)
+    val_loader = DataLoader(val_dataset, batch_size=64)
+    
+    # Initialize server
+    server = FederatedServer(model, num_honest, num_adversarial)
+    
+    # Improved data distribution
+    distribute_data_to_participants(dataset, train_indices, server, min_samples=5)
+    
+    print(f"Starting FL with {num_honest} honest and {num_adversarial} adversarial participants")
+    print(f"Bootstrap rounds: {server.bootstrap_rounds}, Whitelist rounds: {server.whitelist_rounds}")
+    print(f"Removal threshold: {server.removal_threshold} MAD, Max removal rate: {server.max_removal_rate*100}%")
+    
+    # Track removed participants
+    removed_participants = []
+    
+    # Main training loop
+    for round in range(rounds):
+        gradients = []
+        active_indices = []
+        
+        # Check if we have enough active participants
+        active_count = sum(1 for p in server.participants if p['active'] and p['data'] is not None)
+        if active_count < server.min_participants:
+            print(f"Stopping at round {round} - not enough active participants")
+            break
+        
+        # Train participants
+        for i, p in enumerate(server.participants):
+            if not p['active'] or p['data'] is None:
+                continue
+                
+            try:
+                grad = train_participant(
+                    p['model'],
+                    p['data'],
+                    is_adversarial=p['is_adversarial'],
+                    epoch=round
+                )
+                gradients.append(grad)
+                active_indices.append(i)
+            except Exception as e:
+                print(f"Error training participant {i}: {e}")
+                p['active'] = False  # Deactivate on error
+        
+        # Update model
+        if len(active_indices) >= server.min_participants:
+            server.update_model(gradients, active_indices, val_loader)
+        else:
+            print(f"Skipping round {round+1} - not enough active participants")
+            continue
+            
+        # Detect anomalies
+        candidates = server.detect_anomalies(active_indices)
+        
+        # Remove participants
+        if candidates:
+            honest_removed = sum(1 for idx in candidates if not server.participants[idx]['is_adversarial'])
+            adv_removed = len(candidates) - honest_removed
+            
+            for idx in candidates:
+                server.participants[idx]['active'] = False
+                server.participants[idx]['removed_round'] = round
+                removed_participants.append(idx)
+            
+            print(f"Round {round+1}: Removed {len(candidates)} participants "
+                  f"(Honest: {honest_removed}, Adversarial: {adv_removed})")
+            print(f"Current model accuracy: {server.model_acc_history[-1]:.2f}")
+        
+        # Progress update
+        if (round + 1) % 3 == 0 or round == 0:
+            active_honest = sum(1 for i in active_indices if not server.participants[i]['is_adversarial'])
+            active_adv = sum(1 for i in active_indices if server.participants[i]['is_adversarial'])
+            print(f"Round {round+1}: Active: {len(active_indices)} "
+                  f"(Honest: {active_honest}, Adversarial: {active_adv}), "
+                  f"Accuracy: {server.model_acc_history[-1]:.2f}")
+        
+        # Early stopping if too few participants remain
+        if len(active_indices) <= server.min_participants:
+            print(f"Stopping early at round {round+1} - minimum participant threshold reached")
+            break
+    
+    # Final evaluation
+    metrics = calculate_metrics(server, removed_participants)
+    print_detection_performance(metrics)
+    
+    # Print summary
+    total_honest = num_honest
+    total_adv = num_adversarial
+    removed_honest = sum(1 for idx in removed_participants if not server.participants[idx]['is_adversarial'])
+    removed_adv = sum(1 for idx in removed_participants if server.participants[idx]['is_adversarial'])
+    
+    print(f"\nFINAL RESULTS:")
+    print(f"Honest participants: {total_honest - removed_honest}/{total_honest} remaining "
+          f"({removed_honest/total_honest*100:.1f}% removed)")
+    print(f"Adversarial participants: {total_adv - removed_adv}/{total_adv} remaining "
+          f"({removed_adv/total_adv*100:.1f}% removed)")
+    print(f"Final model accuracy: {server.model_acc_history[-1]:.2f}")
+    
+    # Create visualization
+    fig = plot_results(server, removed_participants)
+    
+    return server, removed_participants, metrics, fig
+
+# ========================
+# 8. V2G Analysis Functions
+# ========================
+def analyze_participant_behavior(server, removed_participants):
+    """Analyze participant behavior patterns for V2G"""
+    print("\nPARTICIPANT BEHAVIOR ANALYSIS:")
+    print("--------------------------------------------------")
+    
+    # Calculate selection frequency
+    honest_selection = []
+    adv_selection = []
+    
+    for i, p in enumerate(server.participants):
+        selection_rate = p['selection_count'] / max(1, server.current_round)
+        if p['is_adversarial']:
+            adv_selection.append(selection_rate)
+        else:
+            honest_selection.append(selection_rate)
+    
+    # Calculate outlier frequency
+    honest_outlier = [p['outlier_frequency'] for p in server.participants if not p['is_adversarial']]
+    adv_outlier = [p['outlier_frequency'] for p in server.participants if p['is_adversarial']]
+    
+    # Print summary stats
+    print(f"{'Average selection rate (honest):':<35}{np.mean(honest_selection) if honest_selection else 0:.3f}")
+    print(f"{'Average selection rate (adversarial):':<35}{np.mean(adv_selection) if adv_selection else 0:.3f}")
+    print(f"{'Average outlier frequency (honest):':<35}{np.mean(honest_outlier) if honest_outlier else 0:.3f}")
+    print(f"{'Average outlier frequency (adversarial):':<35}{np.mean(adv_outlier) if adv_outlier else 0:.3f}")
+    
+    # Calculate removal statistics
+    removed_honest_indices = [i for i in removed_participants if not server.participants[i]['is_adversarial']]
+    removed_adv_indices = [i for i in removed_participants if server.participants[i]['is_adversarial']]
+    
+    # Analyze when participants were removed
+    early_rounds = server.whitelist_rounds + 1
+    mid_round = (server.current_round + server.whitelist_rounds) // 2
+    late_rounds = mid_round + 1
+    
+    early_removed_honest = sum(1 for i in removed_honest_indices 
+                           if server.participants[i].get('removed_round') is not None 
+                           and server.participants[i]['removed_round'] < early_rounds)
+                           
+    early_removed_adv = sum(1 for i in removed_adv_indices 
+                         if server.participants[i].get('removed_round') is not None 
+                         and server.participants[i]['removed_round'] < early_rounds)
+                         
+    mid_removed_honest = sum(1 for i in removed_honest_indices 
+                          if server.participants[i].get('removed_round') is not None 
+                          and early_rounds <= server.participants[i]['removed_round'] < late_rounds)
+                          
+    mid_removed_adv = sum(1 for i in removed_adv_indices 
+                        if server.participants[i].get('removed_round') is not None 
+                        and early_rounds <= server.participants[i]['removed_round'] < late_rounds)
+                        
+    late_removed_honest = sum(1 for i in removed_honest_indices 
+                           if server.participants[i].get('removed_round') is not None 
+                           and server.participants[i]['removed_round'] >= late_rounds)
+                           
+    late_removed_adv = sum(1 for i in removed_adv_indices 
+                         if server.participants[i].get('removed_round') is not None 
+                         and server.participants[i]['removed_round'] >= late_rounds)
+    
+    print("\nREMOVAL PATTERNS:")
+    print(f"{'Early removals (rounds <= '+str(early_rounds)+')':<40}")
+    print(f"{'   Honest:':<15}{early_removed_honest}")
+    print(f"{'   Adversarial:':<15}{early_removed_adv}")
+    
+    print(f"{'Mid removals (rounds '+str(early_rounds+1)+'-'+str(late_rounds-1)+')':<40}")
+    print(f"{'   Honest:':<15}{mid_removed_honest}")
+    print(f"{'   Adversarial:':<15}{mid_removed_adv}")
+    
+    print(f"{'Late removals (rounds >= '+str(late_rounds)+')':<40}")
+    print(f"{'   Honest:':<15}{late_removed_honest}")
+    print(f"{'   Adversarial:':<15}{late_removed_adv}")
+    
+    return {
+        'honest_selection': honest_selection,
+        'adv_selection': adv_selection,
+        'honest_outlier': honest_outlier,
+        'adv_outlier': adv_outlier,
+        'early_removed': {'honest': early_removed_honest, 'adv': early_removed_adv},
+        'mid_removed': {'honest': mid_removed_honest, 'adv': mid_removed_adv},
+        'late_removed': {'honest': late_removed_honest, 'adv': late_removed_adv}
+    }
+
+# ========================
+# 9. Generating V2G Adversarial Data
+# ========================
+def create_adversarial_v2g_data(original_data, attack_type="value_flipping"):
+    """Create adversarial V2G data for testing"""
+    adversarial_data = original_data.copy()
+    
+    if attack_type == "value_flipping":
+        # Flip discharge rate (positive becomes negative and vice versa)
+        if 'discharge_rate_kW' in adversarial_data.columns:
+            adversarial_data['discharge_rate_kW'] = -adversarial_data['discharge_rate_kW']
+        
+        # Slightly alter energy requested
+        if 'energy_requested_kWh' in adversarial_data.columns:
+            adversarial_data['energy_requested_kWh'] = adversarial_data['energy_requested_kWh'] * 1.2
+    
+    elif attack_type == "capacity_inflation":
+        # Report higher battery capacity
+        if 'battery_capacity_kWh' in adversarial_data.columns:
+            adversarial_data['battery_capacity_kWh'] = adversarial_data['battery_capacity_kWh'] * 1.3
+        
+        # Report higher current charge
+        if 'current_charge_kWh' in adversarial_data.columns:
+            adversarial_data['current_charge_kWh'] = adversarial_data['current_charge_kWh'] * 1.15
+    
+    elif attack_type == "mixed_attack":
+        # Randomly apply different attacks
+        if random.random() < 0.5:
+            # Sometimes flip discharge rate
+            if 'discharge_rate_kW' in adversarial_data.columns:
+                adversarial_data['discharge_rate_kW'] = -adversarial_data['discharge_rate_kW'] * 0.8
+        else:
+            # Sometimes inflate capacity
+            if 'battery_capacity_kWh' in adversarial_data.columns:
+                adversarial_data['battery_capacity_kWh'] = adversarial_data['battery_capacity_kWh'] * 1.2
+    
+    return adversarial_data
+
+def generate_v2g_adversarial_dataset(original_csv, output_csv, num_honest=15, num_adversarial=5, 
+                                    attack_types=None):
+    """Generate a V2G dataset with adversarial participants"""
+    if attack_types is None:
+        attack_types = ["value_flipping", "capacity_inflation", "mixed_attack"]
+    
+    # Load original dataset
+    data = pd.read_csv(original_csv)
+    
+    # Get unique participant IDs
+    participant_ids = data['participant_id'].unique()
+    
+    if len(participant_ids) < num_honest + num_adversarial:
+        print(f"Warning: Not enough participants in dataset. Using {len(participant_ids)} participants.")
+        num_total = len(participant_ids)
+        num_honest = int(num_total * 0.7)
+        num_adversarial = num_total - num_honest
+    
+    # Select honest and adversarial participants
+    adv_participant_ids = np.random.choice(participant_ids, num_adversarial, replace=False)
+    honest_participant_ids = np.array([p for p in participant_ids if p not in adv_participant_ids])
+    honest_participant_ids = np.random.choice(honest_participant_ids, num_honest, replace=False)
+    
+    # Create output dataframe
+    output_data = pd.DataFrame()
+    
+    # Add honest participants (unchanged)
+    for p_id in honest_participant_ids:
+        participant_data = data[data['participant_id'] == p_id].copy()
+        participant_data['label'] = 'honest'
+        output_data = pd.concat([output_data, participant_data])
+    
+    # Add adversarial participants (modified)
+    for i, p_id in enumerate(adv_participant_ids):
+        participant_data = data[data['participant_id'] == p_id].copy()
+        attack_type = attack_types[i % len(attack_types)]
+        
+        # Apply attack
+        adversarial_data = create_adversarial_v2g_data(participant_data, attack_type)
+        adversarial_data['label'] = f'adversarial_{attack_type}'
+        
+        output_data = pd.concat([output_data, adversarial_data])
+    
+    # Save to CSV
+    output_data.to_csv(output_csv, index=False)
+    print(f"Generated adversarial dataset with {num_honest} honest and {num_adversarial} adversarial participants")
+    print(f"Saved to {output_csv}")
+    
+    return output_data
+
+# ========================
+# 10. Main Execution
+# ========================
+if __name__ == "__main__":
+    # Set device to CPU for compatibility
+    device = torch.device('cpu')
+    print(f"Using device: {device}")
+    
+    # CSV file path - use raw string to avoid escape character issues
+    dataset_path = r"C:\Users\Administrator\Downloads\v2g_simulated_dataset (1).csv"  # Use a raw string to avoid escape character issues
+    
+    try:
+        # Option 1: Use the existing dataset with adversarial majority test
+        print("Running V2G Federated Learning with adversarial majority...")
+        server, removed, metrics, fig = run_v2g_simulation(
+            dataset_path=dataset_path,
+            num_honest=45,        # Fewer honest
+            num_adversarial=51,  # More adversarial
+            rounds=100             # More rounds
+        )
+        
+        # Perform additional analysis
+        behavior_metrics = analyze_participant_behavior(server, removed)
+        
+        # Save results
+        plt.figure(fig.number)
+        plt.savefig('v2g_adv_majority_results.png', bbox_inches='tight')
+        plt.close(fig)
+
+        print(f"\nSimulation completed. Results saved to v2g_adv_majority_results.png")
+        print(f"Detection F1 score: {metrics['f1']:.2f}%")
+        print(f"Final model accuracy: {metrics['model_accuracy']:.2f}%")
+        
+    except Exception as e:
+        print(f"Error in simulation: {str(e)}")
+        
+        # Option 2: Try with balanced scenario as fallback
+        print("\nTrying with balanced scenario instead...")
+        try:
+            server, removed, metrics, fig = run_v2g_simulation(
+                dataset_path=dataset_path,
+                num_honest=50,  
+                num_adversarial=50,
+                rounds=30
+            )
+            
+            # Save results
+            plt.figure(fig.number)
+            plt.savefig('v2g_balanced_results.png', bbox_inches='tight')
+            plt.close(fig)
+            
+            print(f"Simulation completed. Results saved to v2g_balanced_results.png")
+            print(f"Detection F1 score: {metrics['f1']:.2f}%")
+            print(f"Final model accuracy: {metrics['model_accuracy']:.2f}%")
+            
+        except Exception as e2:
+            print(f"Error in fallback simulation: {str(e2)}")
+            
+            # Option 3: Try with minimal scenario
+            print("\nTrying with minimal configuration...")
+            try:
+                server, removed, metrics, fig = run_v2g_simulation(
+                    dataset_path=dataset_path,
+                    num_honest=10,
+                    num_adversarial=10,
+                    rounds=20
+                )
+                
+                # Save results
+                plt.figure(fig.number)
+                plt.savefig('v2g_minimal_results.png', bbox_inches='tight')
+                plt.close(fig)
+                
+                print(f"Minimal simulation completed. Results saved to v2g_minimal_results.png")
+                
+            except Exception as e3:
+                print(f"Error in minimal simulation: {str(e3)}")
+                print("Please check your dataset format and make sure it has the required columns.")
